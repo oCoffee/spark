@@ -16,7 +16,7 @@
  */
 package org.apache.spark.deploy.k8s.integrationtest
 
-import org.apache.spark.deploy.k8s.integrationtest.TestConfig.{getTestImageRepo, getTestImageTag}
+import org.apache.spark.internal.config.SPARK_API_MODE
 
 private[spark] trait PythonTestsSuite { k8sSuite: KubernetesSuite =>
 
@@ -25,50 +25,62 @@ private[spark] trait PythonTestsSuite { k8sSuite: KubernetesSuite =>
 
   test("Run PySpark on simple pi.py example", k8sTestTag) {
     sparkAppConf
-      .set("spark.kubernetes.container.image", s"${getTestImageRepo}/spark-py:${getTestImageTag}")
+      .set("spark.kubernetes.container.image", pyImage)
     runSparkApplicationAndVerifyCompletion(
       appResource = PYSPARK_PI,
       mainClass = "",
-      expectedLogOnCompletion = Seq("Pi is roughly 3"),
+      expectedDriverLogOnCompletion = Seq("Pi is roughly 3"),
       appArgs = Array("5"),
       driverPodChecker = doBasicDriverPyPodCheck,
       executorPodChecker = doBasicExecutorPyPodCheck,
-      appLocator = appLocator,
       isJVM = false)
   }
 
-  test("Run PySpark with Python2 to test a pyfiles example", k8sTestTag) {
+  test("Run PySpark to test a pyfiles example", k8sTestTag) {
     sparkAppConf
-      .set("spark.kubernetes.container.image", s"${getTestImageRepo}/spark-py:${getTestImageTag}")
-      .set("spark.kubernetes.pyspark.pythonversion", "2")
+      .set("spark.kubernetes.container.image", pyImage)
     runSparkApplicationAndVerifyCompletion(
       appResource = PYSPARK_FILES,
       mainClass = "",
-      expectedLogOnCompletion = Seq(
+      expectedDriverLogOnCompletion = Seq(
         "Python runtime version check is: True",
-        "Python environment version check is: True"),
-      appArgs = Array("python"),
+        "Python environment version check is: True",
+        "Python runtime version check for executor is: True"),
+      appArgs = Array("python3"),
       driverPodChecker = doBasicDriverPyPodCheck,
       executorPodChecker = doBasicExecutorPyPodCheck,
-      appLocator = appLocator,
       isJVM = false,
       pyFiles = Some(PYSPARK_CONTAINER_TESTS))
   }
 
-  test("Run PySpark with Python3 to test a pyfiles example", k8sTestTag) {
+  test("Run PySpark with memory customization", k8sTestTag) {
     sparkAppConf
-      .set("spark.kubernetes.container.image", s"${getTestImageRepo}/spark-py:${getTestImageTag}")
-      .set("spark.kubernetes.pyspark.pythonversion", "3")
+      .set("spark.kubernetes.container.image", pyImage)
+      .set("spark.kubernetes.memoryOverheadFactor", s"$memOverheadConstant")
+      .set("spark.executor.pyspark.memory", s"${additionalMemory}m")
     runSparkApplicationAndVerifyCompletion(
-      appResource = PYSPARK_FILES,
+      appResource = PYSPARK_MEMORY_CHECK,
       mainClass = "",
-      expectedLogOnCompletion = Seq(
-        "Python runtime version check is: True",
-        "Python environment version check is: True"),
-      appArgs = Array("python3"),
+      expectedDriverLogOnCompletion = Seq(
+        "PySpark Worker Memory Check is: True"),
+      appArgs = Array(s"$additionalMemoryInBytes"),
+      driverPodChecker = doDriverMemoryCheck,
+      executorPodChecker = doExecutorMemoryCheck,
+      isJVM = false,
+      pyFiles = Some(PYSPARK_CONTAINER_TESTS))
+  }
+
+  // Needs to install Spark Connect dependencies in Python Dockerfile, ignored for now.
+  ignore("Run PySpark with Spark Connect", k8sTestTag) {
+    sparkAppConf.set("spark.kubernetes.container.image", pyImage)
+    sparkAppConf.set(SPARK_API_MODE.key, "connect")
+    runSparkApplicationAndVerifyCompletion(
+      appResource = PYSPARK_CONNECT_FILES,
+      mainClass = "",
+      expectedDriverLogOnCompletion = Seq("Python runtime version check for executor is: True"),
+      appArgs = Array(sparkAppConf.get("spark.master")),
       driverPodChecker = doBasicDriverPyPodCheck,
       executorPodChecker = doBasicExecutorPyPodCheck,
-      appLocator = appLocator,
       isJVM = false,
       pyFiles = Some(PYSPARK_CONTAINER_TESTS))
   }
@@ -77,7 +89,9 @@ private[spark] trait PythonTestsSuite { k8sSuite: KubernetesSuite =>
 private[spark] object PythonTestsSuite {
   val CONTAINER_LOCAL_PYSPARK: String = "local:///opt/spark/examples/src/main/python/"
   val PYSPARK_PI: String = CONTAINER_LOCAL_PYSPARK + "pi.py"
-  val PYSPARK_FILES: String = CONTAINER_LOCAL_PYSPARK + "pyfiles.py"
-  val PYSPARK_CONTAINER_TESTS: String = CONTAINER_LOCAL_PYSPARK + "py_container_checks.py"
+  val TEST_LOCAL_PYSPARK: String = "local:///opt/spark/tests/"
+  val PYSPARK_FILES: String = TEST_LOCAL_PYSPARK + "pyfiles.py"
+  val PYSPARK_CONNECT_FILES: String = TEST_LOCAL_PYSPARK + "pyfiles_connect.py"
+  val PYSPARK_CONTAINER_TESTS: String = TEST_LOCAL_PYSPARK + "py_container_checks.py"
+  val PYSPARK_MEMORY_CHECK: String = TEST_LOCAL_PYSPARK + "worker_memory_check.py"
 }
-

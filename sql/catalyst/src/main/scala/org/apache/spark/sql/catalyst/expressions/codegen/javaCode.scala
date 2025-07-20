@@ -20,9 +20,11 @@ package org.apache.spark.sql.catalyst.expressions.codegen
 import java.lang.{Boolean => JBool}
 
 import scala.collection.mutable.ArrayBuffer
-import scala.language.{existentials, implicitConversions}
+import scala.language.implicitConversions
 
-import org.apache.spark.sql.catalyst.trees.TreeNode
+import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.trees.{LeafLike, TreeNode}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types.{BooleanType, DataType}
 
 /**
@@ -114,6 +116,21 @@ object JavaCode {
   def isNullExpression(code: String): SimpleExprValue = {
     expression(code, BooleanType)
   }
+
+  /**
+   * Create an `Inline` for Java Class name.
+   */
+  def javaType(javaClass: Class[_]): Inline = Inline(javaClass.getName)
+
+  /**
+   * Create an `Inline` for Java Type name.
+   */
+  def javaType(dataType: DataType): Inline = Inline(CodeGenerator.javaType(dataType))
+
+  /**
+   * Create an `Inline` for boxed Java Type name.
+   */
+  def boxedType(dataType: DataType): Inline = Inline(CodeGenerator.boxedType(dataType))
 }
 
 /**
@@ -128,9 +145,14 @@ trait Block extends TreeNode[Block] with JavaCode {
     case _ => code.trim
   }
 
+  // We could remove comments, extra whitespaces and newlines when calculating length as it is used
+  // only for codegen method splitting, but SPARK-30564 showed that this is a performance critical
+  // function so we decided not to do so.
   def length: Int = toString.length
 
-  def nonEmpty: Boolean = toString.nonEmpty
+  def isEmpty: Boolean = toString.isEmpty
+
+  def nonEmpty: Boolean = !isEmpty
 
   // The leading prefix that should be stripped from each line.
   // By default we strip blanks or control characters followed by '|' from the line.
@@ -155,7 +177,7 @@ trait Block extends TreeNode[Block] with JavaCode {
 
     @inline def transform(e: ExprValue): ExprValue = {
       val newE = f lift e
-      if (!newE.isDefined || newE.get.equals(e)) {
+      if (newE.isEmpty || newE.get.equals(e)) {
         e
       } else {
         changed = true
@@ -166,7 +188,7 @@ trait Block extends TreeNode[Block] with JavaCode {
     def doTransform(arg: Any): AnyRef = arg match {
       case e: ExprValue => transform(e)
       case Some(value) => Some(doTransform(value))
-      case seq: Traversable[_] => seq.map(doTransform)
+      case seq: Iterable[_] => seq.map(doTransform)
       case other: AnyRef => other
     }
 
@@ -180,27 +202,43 @@ trait Block extends TreeNode[Block] with JavaCode {
     case _ => code"$this\n$other"
   }
 
-  override def verboseString: String = toString
+  override def verboseString(maxFields: Int): String = toString
+  override def simpleStringWithNodeId(): String = {
+    throw SparkException.internalError(s"$nodeName does not implement simpleStringWithNodeId")
+  }
 }
 
 object Block {
 
   val CODE_BLOCK_BUFFER_LENGTH: Int = 512
 
+  /**
+   * A custom string interpolator which inlines a string into code block.
+   */
+  implicit class InlineHelper(val sc: StringContext) extends AnyVal {
+    def inline(args: Any*): Inline = {
+      val inlineString = sc.raw(args: _*)
+      Inline(inlineString)
+    }
+  }
+
   implicit def blocksToBlock(blocks: Seq[Block]): Block = blocks.reduceLeft(_ + _)
 
   implicit class BlockHelper(val sc: StringContext) extends AnyVal {
+    /**
+     * A string interpolator that retains references to the `JavaCode` inputs, and behaves like
+     * the Scala builtin StringContext.s() interpolator otherwise, i.e. it will treat escapes in
+     * the code parts, and will not treat escapes in the input arguments.
+     */
     def code(args: Any*): Block = {
-      sc.checkLengths(args)
+      StringContext.checkLengths(args, sc.parts)
       if (sc.parts.length == 0) {
         EmptyBlock
       } else {
         args.foreach {
-          case _: ExprValue =>
-          case _: Int | _: Long | _: Float | _: Double | _: String =>
-          case _: Block =>
-          case other => throw new IllegalArgumentException(
-            s"Can not interpolate ${other.getClass.getName} into code block.")
+          case _: ExprValue | _: Inline | _: Block =>
+          case _: Boolean | _: Byte | _: Int | _: Long | _: Float | _: Double | _: String =>
+          case other => throw QueryExecutionErrors.cannotInterpolateClassIntoCodeBlockError(other)
         }
 
         val (codeParts, blockInputs) = foldLiteralArgs(sc.parts, args)
@@ -218,19 +256,19 @@ object Block {
     val inputs = args.iterator
     val buf = new StringBuilder(Block.CODE_BLOCK_BUFFER_LENGTH)
 
-    buf.append(strings.next)
+    buf.append(StringContext.processEscapes(strings.next()))
     while (strings.hasNext) {
-      val input = inputs.next
+      val input = inputs.next()
       input match {
         case _: ExprValue | _: CodeBlock =>
           codeParts += buf.toString
-          buf.clear
+          buf.clear()
           blockInputs += input.asInstanceOf[JavaCode]
         case EmptyBlock =>
         case _ =>
           buf.append(input)
       }
-      buf.append(strings.next)
+      buf.append(StringContext.processEscapes(strings.next()))
     }
     codeParts += buf.toString
 
@@ -254,18 +292,28 @@ case class CodeBlock(codeParts: Seq[String], blockInputs: Seq[JavaCode]) extends
     val strings = codeParts.iterator
     val inputs = blockInputs.iterator
     val buf = new StringBuilder(Block.CODE_BLOCK_BUFFER_LENGTH)
-    buf.append(StringContext.treatEscapes(strings.next))
+    buf.append(strings.next())
     while (strings.hasNext) {
-      buf.append(inputs.next)
-      buf.append(StringContext.treatEscapes(strings.next))
+      buf.append(inputs.next())
+      buf.append(strings.next())
     }
     buf.toString
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Block]): Block =
+    super.legacyWithNewChildren(newChildren)
 }
 
-case object EmptyBlock extends Block with Serializable {
+case object EmptyBlock extends Block with Serializable with LeafLike[Block] {
   override val code: String = ""
-  override def children: Seq[Block] = Seq.empty
+}
+
+/**
+ * A piece of java code snippet inlines all types of input arguments into a string without
+ * tracking any reference of `JavaCode` instances.
+ */
+case class Inline(codeString: String) extends JavaCode {
+  override val code: String = codeString
 }
 
 /**

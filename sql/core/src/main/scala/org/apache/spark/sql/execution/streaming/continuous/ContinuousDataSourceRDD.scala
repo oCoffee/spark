@@ -19,16 +19,17 @@ package org.apache.spark.sql.execution.streaming.continuous
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.execution.datasources.v2.RowToUnsafeInputPartitionReader
-import org.apache.spark.sql.sources.v2.reader._
-import org.apache.spark.sql.sources.v2.reader.streaming.ContinuousInputPartitionReader
+import org.apache.spark.sql.connector.read.InputPartition
+import org.apache.spark.sql.connector.read.streaming.ContinuousPartitionReaderFactory
+import org.apache.spark.sql.execution.metric.{CustomMetrics, SQLMetric}
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.NextIterator
 
 class ContinuousDataSourceRDDPartition(
     val index: Int,
-    val inputPartition: InputPartition[InternalRow])
+    val inputPartition: InputPartition)
   extends Partition with Serializable {
 
   // This is semantically a lazy val - it's initialized once the first time a call to
@@ -51,13 +52,21 @@ class ContinuousDataSourceRDD(
     sc: SparkContext,
     dataQueueSize: Int,
     epochPollIntervalMs: Long,
-    private val readerInputPartitions: Seq[InputPartition[InternalRow]])
+    private val inputPartitions: Seq[InputPartition],
+    schema: StructType,
+    partitionReaderFactory: ContinuousPartitionReaderFactory,
+    customMetrics: Map[String, SQLMetric])
   extends RDD[InternalRow](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = {
-    readerInputPartitions.zipWithIndex.map {
+    inputPartitions.zipWithIndex.map {
       case (inputPartition, index) => new ContinuousDataSourceRDDPartition(index, inputPartition)
     }.toArray
+  }
+
+  private def castPartition(split: Partition): ContinuousDataSourceRDDPartition = split match {
+    case p: ContinuousDataSourceRDDPartition => p
+    case _ => throw new SparkException(s"[BUG] Not a ContinuousDataSourceRDDPartition: $split")
   }
 
   /**
@@ -71,17 +80,27 @@ class ContinuousDataSourceRDD(
     }
 
     val readerForPartition = {
-      val partition = split.asInstanceOf[ContinuousDataSourceRDDPartition]
+      val partition = castPartition(split)
       if (partition.queueReader == null) {
-        partition.queueReader =
-          new ContinuousQueuedDataReader(partition, context, dataQueueSize, epochPollIntervalMs)
+        val partitionReader = partitionReaderFactory.createReader(
+          partition.inputPartition)
+        partition.queueReader = new ContinuousQueuedDataReader(
+          partition.index, partitionReader, schema, context, dataQueueSize, epochPollIntervalMs)
       }
 
       partition.queueReader
     }
 
+    val partitionReader = readerForPartition.getPartitionReader()
     new NextIterator[InternalRow] {
+      private var numRow = 0L
+
       override def getNext(): InternalRow = {
+        if (numRow % CustomMetrics.NUM_ROWS_PER_UPDATE == 0) {
+          CustomMetrics.updateMetrics(
+            partitionReader.currentMetricsValues.toImmutableArraySeq, customMetrics)
+        }
+        numRow += 1
         readerForPartition.next() match {
           case null =>
             finished = true
@@ -95,19 +114,6 @@ class ContinuousDataSourceRDD(
   }
 
   override def getPreferredLocations(split: Partition): Seq[String] = {
-    split.asInstanceOf[ContinuousDataSourceRDDPartition].inputPartition.preferredLocations()
-  }
-}
-
-object ContinuousDataSourceRDD {
-  private[continuous] def getContinuousReader(
-      reader: InputPartitionReader[InternalRow]): ContinuousInputPartitionReader[_] = {
-    reader match {
-      case r: ContinuousInputPartitionReader[InternalRow] => r
-      case wrapped: RowToUnsafeInputPartitionReader =>
-        wrapped.rowReader.asInstanceOf[ContinuousInputPartitionReader[Row]]
-      case _ =>
-        throw new IllegalStateException(s"Unknown continuous reader type ${reader.getClass}")
-    }
+    castPartition(split).inputPartition.preferredLocations().toImmutableArraySeq
   }
 }

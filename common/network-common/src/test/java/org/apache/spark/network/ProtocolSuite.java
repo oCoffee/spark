@@ -25,9 +25,9 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.FileRegion;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.MessageToMessageEncoder;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import org.apache.spark.network.protocol.ChunkFetchFailure;
 import org.apache.spark.network.protocol.ChunkFetchRequest;
@@ -116,8 +116,8 @@ public class ProtocolSuite {
       throws Exception {
 
       ByteArrayWritableChannel channel = new ByteArrayWritableChannel(Ints.checkedCast(in.count()));
-      while (in.transfered() < in.count()) {
-        in.transferTo(channel, in.transfered());
+      while (in.transferred() < in.count()) {
+        in.transferTo(channel, in.transferred());
       }
       out.add(Unpooled.wrappedBuffer(channel.getData()));
     }
